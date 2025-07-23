@@ -748,7 +748,21 @@ func handleGitHubCallback(c *gin.Context) {
 	data.Set("code", code)
 	data.Set("redirect_uri", "https://tenkaiserver-production.up.railway.app/api/auth/github/callback")
 
-	tokenResp, err := http.PostForm(tokenURL, data)
+	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "リクエスト作成に失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+	
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	
+	client := &http.Client{}
+	tokenResp, err := client.Do(req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{
 			Success: false,
@@ -769,9 +783,9 @@ func handleGitHubCallback(c *gin.Context) {
 		return
 	}
 
-	// トークンをパース
-	tokenValues, err := url.ParseQuery(string(tokenBody))
-	if err != nil {
+	// JSONレスポンスとしてパース
+	var tokenResult GitHubTokenResponse
+	if err := json.Unmarshal(tokenBody, &tokenResult); err != nil {
 		c.JSON(http.StatusInternalServerError, Response{
 			Success: false,
 			Message: "トークンのパースに失敗しました",
@@ -780,7 +794,7 @@ func handleGitHubCallback(c *gin.Context) {
 		return
 	}
 
-	accessToken := tokenValues.Get("access_token")
+	accessToken := tokenResult.AccessToken
 	if accessToken == "" {
 		c.JSON(http.StatusBadRequest, Response{
 			Success: false,
