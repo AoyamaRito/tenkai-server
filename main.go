@@ -37,7 +37,6 @@ type Response struct {
 // 初期化リクエスト
 type InitRequest struct {
 	WorkDir string `json:"workDir" binding:"required"`
-	APIKey  string `json:"apiKey"`
 }
 
 // 保存リクエスト
@@ -59,6 +58,23 @@ type AnalyzeRequest struct {
 }
 
 func main() {
+	// 環境変数からGemini APIキーを取得して初期化
+	geminiAPIKey := os.Getenv("GEMINI_API_KEY")
+	if geminiAPIKey != "" {
+		ctx := context.Background()
+		var err error
+		genClient, err = genai.NewClient(ctx, option.WithAPIKey(geminiAPIKey))
+		if err != nil {
+			log.Printf("Gemini API初期化エラー: %v", err)
+		} else {
+			model = genClient.GenerativeModel("gemini-pro")
+			model.SetTemperature(0.7)
+			log.Println("Gemini APIを環境変数から初期化しました")
+		}
+	} else {
+		log.Println("GEMINI_API_KEY環境変数が設定されていません")
+	}
+
 	// Ginの初期化
 	r := gin.Default()
 
@@ -126,18 +142,6 @@ func handleInit(c *gin.Context) {
 		}
 	}
 
-	// Gemini APIの初期化
-	if req.APIKey != "" {
-		ctx := context.Background()
-		genClient, err = genai.NewClient(ctx, option.WithAPIKey(req.APIKey))
-		if err != nil {
-			log.Printf("Gemini API初期化エラー: %v", err)
-		} else {
-			model = genClient.GenerativeModel("gemini-pro")
-			model.SetTemperature(0.7)
-			log.Println("Gemini APIを初期化しました")
-		}
-	}
 
 	c.JSON(http.StatusOK, Response{
 		Success: true,
