@@ -662,13 +662,19 @@ func generateAICommitMessage(changes string) string {
 
 // GitHub OAuth認証処理
 func handleGitHubCallback(c *gin.Context) {
-	var req GitHubCallbackRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, Response{
-			Success: false,
-			Message: "リクエストが不正です",
-			Error:   err.Error(),
-		})
+	// クエリパラメータから直接取得
+	code := c.Query("code")
+	state := c.Query("state")
+	errorParam := c.Query("error")
+	
+	// エラーチェック
+	if errorParam != "" {
+		c.Redirect(http.StatusTemporaryRedirect, "https://tenkai-production.up.railway.app/auth?error="+errorParam)
+		return
+	}
+	
+	if code == "" {
+		c.Redirect(http.StatusTemporaryRedirect, "https://tenkai-production.up.railway.app/auth?error=missing_code")
 		return
 	}
 
@@ -677,10 +683,7 @@ func handleGitHubCallback(c *gin.Context) {
 	clientSecret := os.Getenv("GITHUB_CLIENT_SECRET")
 	
 	if clientID == "" || clientSecret == "" {
-		c.JSON(http.StatusInternalServerError, Response{
-			Success: false,
-			Message: "GitHub OAuth設定が不完全です",
-		})
+		c.Redirect(http.StatusTemporaryRedirect, "https://tenkai-production.up.railway.app/auth?error=oauth_config_missing")
 		return
 	}
 
@@ -689,8 +692,8 @@ func handleGitHubCallback(c *gin.Context) {
 	data := url.Values{}
 	data.Set("client_id", clientID)
 	data.Set("client_secret", clientSecret)
-	data.Set("code", req.Code)
-	data.Set("redirect_uri", req.RedirectURI)
+	data.Set("code", code)
+	data.Set("redirect_uri", "https://tenkaiserver-production.up.railway.app/api/auth/github/callback")
 
 	tokenResp, err := http.PostForm(tokenURL, data)
 	if err != nil {
@@ -761,12 +764,11 @@ func handleGitHubCallback(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, Response{
-		Success: true,
-		Message: "認証が完了しました",
-		Data: map[string]interface{}{
-			"user":         user,
-			"access_token": accessToken,
-		},
-	})
+	// 認証成功後、ユーザー情報をクッキーまたはセッションに保存してフロントエンドにリダイレクト
+	// 簡易実装：URLパラメータでトークンを渡す（本番環境では安全な方法を使用）
+	redirectURL := fmt.Sprintf("https://tenkai-production.up.railway.app/app?token=%s&user=%s", 
+		accessToken, 
+		url.QueryEscape(user.Login))
+	
+	c.Redirect(http.StatusTemporaryRedirect, redirectURL)
 }
