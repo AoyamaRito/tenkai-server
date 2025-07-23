@@ -3,9 +3,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -57,6 +60,26 @@ type AnalyzeRequest struct {
 	Prompt string `json:"prompt"`
 }
 
+// GitHub OAuth関連
+type GitHubCallbackRequest struct {
+	Code        string `json:"code" binding:"required"`
+	RedirectURI string `json:"redirect_uri" binding:"required"`
+}
+
+type GitHubTokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	Scope       string `json:"scope"`
+}
+
+type GitHubUser struct {
+	ID        int    `json:"id"`
+	Login     string `json:"login"`
+	Name      string `json:"name"`
+	Email     string `json:"email"`
+	AvatarURL string `json:"avatar_url"`
+}
+
 func main() {
 	// 環境変数からGemini APIキーを取得して初期化
 	geminiAPIKey := os.Getenv("GEMINI_API_KEY")
@@ -101,6 +124,7 @@ func main() {
 	r.POST("/api/draft/switch", handleDraftSwitch)
 	r.GET("/api/status", handleStatus)
 	r.POST("/api/ai/analyze", handleAIAnalyze)
+	r.POST("/api/auth/github/callback", handleGitHubCallback)
 
 	// サーバー起動
 	port := os.Getenv("PORT")
@@ -185,7 +209,8 @@ func handleSave(c *gin.Context) {
 	}
 
 	// すべての変更をステージング
-	if err := w.Add("."); err != nil {
+	_, err = w.Add(".")
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{
 			Success: false,
 			Message: "変更のステージングに失敗しました",
@@ -633,4 +658,115 @@ func generateAICommitMessage(changes string) string {
 	}
 	
 	return ""
+}
+
+// GitHub OAuth認証処理
+func handleGitHubCallback(c *gin.Context) {
+	var req GitHubCallbackRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, Response{
+			Success: false,
+			Message: "リクエストが不正です",
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	// GitHub OAuth App設定
+	clientID := os.Getenv("GITHUB_CLIENT_ID")
+	clientSecret := os.Getenv("GITHUB_CLIENT_SECRET")
+	
+	if clientID == "" || clientSecret == "" {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "GitHub OAuth設定が不完全です",
+		})
+		return
+	}
+
+	// アクセストークンを取得
+	tokenURL := "https://github.com/login/oauth/access_token"
+	data := url.Values{}
+	data.Set("client_id", clientID)
+	data.Set("client_secret", clientSecret)
+	data.Set("code", req.Code)
+	data.Set("redirect_uri", req.RedirectURI)
+
+	tokenResp, err := http.PostForm(tokenURL, data)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "GitHubトークン取得に失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+	defer tokenResp.Body.Close()
+
+	tokenBody, err := io.ReadAll(tokenResp.Body)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "レスポンス読み取りに失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	// トークンをパース
+	tokenValues, err := url.ParseQuery(string(tokenBody))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "トークンのパースに失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	accessToken := tokenValues.Get("access_token")
+	if accessToken == "" {
+		c.JSON(http.StatusBadRequest, Response{
+			Success: false,
+			Message: "アクセストークンが取得できませんでした",
+		})
+		return
+	}
+
+	// ユーザー情報を取得
+	userURL := "https://api.github.com/user"
+	userReq, _ := http.NewRequest("GET", userURL, nil)
+	userReq.Header.Set("Authorization", "Bearer "+accessToken)
+	userReq.Header.Set("User-Agent", "tenkai-app")
+
+	client := &http.Client{}
+	userResp, err := client.Do(userReq)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "ユーザー情報取得に失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+	defer userResp.Body.Close()
+
+	var user GitHubUser
+	if err := json.NewDecoder(userResp.Body).Decode(&user); err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "ユーザー情報のパースに失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, Response{
+		Success: true,
+		Message: "認証が完了しました",
+		Data: map[string]interface{}{
+			"user":         user,
+			"access_token": accessToken,
+		},
+	})
 }
