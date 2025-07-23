@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -80,6 +81,49 @@ type GitHubUser struct {
 	AvatarURL string `json:"avatar_url"`
 }
 
+// GitHub API関連の構造体
+type GitHubRepository struct {
+	ID       int    `json:"id"`
+	Name     string `json:"name"`
+	FullName string `json:"full_name"`
+	Private  bool   `json:"private"`
+	HTMLURL  string `json:"html_url"`
+	CloneURL string `json:"clone_url"`
+}
+
+type GitHubFile struct {
+	Name        string `json:"name"`
+	Path        string `json:"path"`
+	SHA         string `json:"sha"`
+	Size        int    `json:"size"`
+	URL         string `json:"url"`
+	HTMLURL     string `json:"html_url"`
+	GitURL      string `json:"git_url"`
+	DownloadURL string `json:"download_url"`
+	Type        string `json:"type"`
+	Content     string `json:"content"`
+	Encoding    string `json:"encoding"`
+}
+
+// Tenkai設定構造体
+type TenkaiSettings struct {
+	Version        string                 `json:"version"`
+	CharsPerLine   int                    `json:"chars_per_line"`
+	LinesPerPage   int                    `json:"lines_per_page"`
+	WritingMode    string                 `json:"writing_mode"` // "vertical" or "horizontal"
+	Theme          string                 `json:"theme"`        // "light" or "dark"
+	Repositories   []string               `json:"repositories"` // リポジトリのフルネーム
+	ActiveRepo     string                 `json:"active_repo"`
+	CustomSettings map[string]interface{} `json:"custom_settings"`
+	LastUpdated    string                 `json:"last_updated"`
+}
+
+// 設定取得/保存リクエスト
+type SettingsRequest struct {
+	AccessToken string         `json:"access_token" binding:"required"`
+	Settings    TenkaiSettings `json:"settings,omitempty"`
+}
+
 func main() {
 	// 環境変数からGemini APIキーを取得して初期化
 	geminiAPIKey := os.Getenv("GEMINI_API_KEY")
@@ -125,6 +169,10 @@ func main() {
 	r.GET("/api/status", handleStatus)
 	r.POST("/api/ai/analyze", handleAIAnalyze)
 	r.POST("/api/auth/github/callback", handleGitHubCallback)
+	// GitHub設定管理API
+	r.GET("/api/settings", handleGetSettings)
+	r.POST("/api/settings", handleSaveSettings)
+	r.GET("/api/repositories", handleGetRepositories)
 
 	// サーバー起動
 	port := os.Getenv("PORT")
@@ -664,7 +712,6 @@ func generateAICommitMessage(changes string) string {
 func handleGitHubCallback(c *gin.Context) {
 	// クエリパラメータから直接取得
 	code := c.Query("code")
-	state := c.Query("state")
 	errorParam := c.Query("error")
 	
 	// エラーチェック
@@ -772,3 +819,402 @@ func handleGitHubCallback(c *gin.Context) {
 	
 	c.Redirect(http.StatusTemporaryRedirect, redirectURL)
 }
+
+// GitHub設定管理: 設定取得
+func handleGetSettings(c *gin.Context) {
+	accessToken := c.GetHeader("Authorization")
+	if accessToken == "" {
+		c.JSON(http.StatusUnauthorized, Response{
+			Success: false,
+			Message: "認証が必要です",
+		})
+		return
+	}
+	
+	// "Bearer " プレフィックスを削除
+	if strings.HasPrefix(accessToken, "Bearer ") {
+		accessToken = strings.TrimPrefix(accessToken, "Bearer ")
+	}
+
+	// ユーザー情報を取得
+	user, err := getGitHubUser(accessToken)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, Response{
+			Success: false,
+			Message: "GitHubユーザー情報の取得に失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	// .tenkai-settings リポジトリから設定を取得
+	settings, err := getTenkaiSettings(accessToken, user.Login)
+	if err != nil {
+		// 設定が存在しない場合はデフォルト設定を返す
+		defaultSettings := TenkaiSettings{
+			Version:        "1.0",
+			CharsPerLine:   17,
+			LinesPerPage:   42,
+			WritingMode:    "vertical",
+			Theme:          "light",
+			Repositories:   []string{},
+			ActiveRepo:     "",
+			CustomSettings: make(map[string]interface{}),
+			LastUpdated:    time.Now().Format(time.RFC3339),
+		}
+		
+		c.JSON(http.StatusOK, Response{
+			Success: true,
+			Message: "デフォルト設定を返しました",
+			Data:    defaultSettings,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, Response{
+		Success: true,
+		Data:    settings,
+	})
+}
+
+// GitHub設定管理: 設定保存
+func handleSaveSettings(c *gin.Context) {
+	var req SettingsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, Response{
+			Success: false,
+			Message: "リクエストが不正です",
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	// ユーザー情報を取得
+	user, err := getGitHubUser(req.AccessToken)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, Response{
+			Success: false,
+			Message: "GitHubユーザー情報の取得に失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	// 設定に最終更新日時を設定
+	req.Settings.LastUpdated = time.Now().Format(time.RFC3339)
+
+	// .tenkai-settings リポジトリに設定を保存
+	err = saveTenkaiSettings(req.AccessToken, user.Login, req.Settings)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "設定の保存に失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, Response{
+		Success: true,
+		Message: "設定を保存しました",
+		Data:    req.Settings,
+	})
+}
+
+// GitHub設定管理: リポジトリ一覧取得
+func handleGetRepositories(c *gin.Context) {
+	accessToken := c.GetHeader("Authorization")
+	if accessToken == "" {
+		c.JSON(http.StatusUnauthorized, Response{
+			Success: false,
+			Message: "認証が必要です",
+		})
+		return
+	}
+	
+	// "Bearer " プレフィックスを削除
+	if strings.HasPrefix(accessToken, "Bearer ") {
+		accessToken = strings.TrimPrefix(accessToken, "Bearer ")
+	}
+
+	// GitHubからリポジトリ一覧を取得
+	repos, err := getGitHubRepositories(accessToken)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "リポジトリ一覧の取得に失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, Response{
+		Success: true,
+		Data:    repos,
+	})
+}
+
+// ヘルパー関数: GitHubユーザー情報取得
+func getGitHubUser(accessToken string) (*GitHubUser, error) {
+	userURL := "https://api.github.com/user"
+	req, err := http.NewRequest("GET", userURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("User-Agent", "tenkai-app")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub API error: %d", resp.StatusCode)
+	}
+
+	var user GitHubUser
+	if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
+		return nil, err
+	}
+
+	return &user, nil
+}
+
+// ヘルパー関数: Tenkai設定取得
+func getTenkaiSettings(accessToken, username string) (*TenkaiSettings, error) {
+	// .tenkai-settings リポジトリから settings.json を取得
+	fileURL := fmt.Sprintf("https://api.github.com/repos/%s/.tenkai-settings/contents/settings.json", username)
+	req, err := http.NewRequest("GET", fileURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("User-Agent", "tenkai-app")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("settings not found")
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub API error: %d", resp.StatusCode)
+	}
+
+	var file GitHubFile
+	if err := json.NewDecoder(resp.Body).Decode(&file); err != nil {
+		return nil, err
+	}
+
+	// Base64デコード
+	content, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(file.Content, "\n", ""))
+	if err != nil {
+		return nil, err
+	}
+
+	var settings TenkaiSettings
+	if err := json.Unmarshal(content, &settings); err != nil {
+		return nil, err
+	}
+
+	return &settings, nil
+}
+
+// ヘルパー関数: Tenkai設定保存
+func saveTenkaiSettings(accessToken, username string, settings TenkaiSettings) error {
+	// 設定をJSONに変換
+	settingsJSON, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	// Base64エンコード
+	contentEncoded := base64.StdEncoding.EncodeToString(settingsJSON)
+
+	// 既存ファイルのSHAを取得（更新の場合）
+	existingSHA := ""
+	existingSettings, err := getTenkaiSettings(accessToken, username)
+	if err == nil && existingSettings != nil {
+		// 既存ファイルがある場合、SHAを取得
+		sha, _ := getFileSHA(accessToken, username, "settings.json")
+		existingSHA = sha
+	}
+
+	// .tenkai-settings リポジトリが存在しない場合は作成
+	err = ensureTenkaiSettingsRepo(accessToken, username)
+	if err != nil {
+		return err
+	}
+
+	// ファイルを更新/作成
+	fileURL := fmt.Sprintf("https://api.github.com/repos/%s/.tenkai-settings/contents/settings.json", username)
+	
+	updateData := map[string]interface{}{
+		"message": "tenkai設定を更新",
+		"content": contentEncoded,
+	}
+	
+	if existingSHA != "" {
+		updateData["sha"] = existingSHA
+	}
+
+	updateJSON, err := json.Marshal(updateData)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("PUT", fileURL, strings.NewReader(string(updateJSON)))
+	if err != nil {
+		return err
+	}
+	
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("User-Agent", "tenkai-app")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("GitHub API error: %d, %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+// ヘルパー関数: GitHubリポジトリ一覧取得
+func getGitHubRepositories(accessToken string) ([]GitHubRepository, error) {
+	reposURL := "https://api.github.com/user/repos?sort=updated&per_page=100"
+	req, err := http.NewRequest("GET", reposURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("User-Agent", "tenkai-app")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub API error: %d", resp.StatusCode)
+	}
+
+	var repos []GitHubRepository
+	if err := json.NewDecoder(resp.Body).Decode(&repos); err != nil {
+		return nil, err
+	}
+
+	return repos, nil
+}
+
+// ヘルパー関数: .tenkai-settings リポジトリの確保
+func ensureTenkaiSettingsRepo(accessToken, username string) error {
+	// リポジトリが存在するかチェック
+	repoURL := fmt.Sprintf("https://api.github.com/repos/%s/.tenkai-settings", username)
+	req, err := http.NewRequest("GET", repoURL, nil)
+	if err != nil {
+		return err
+	}
+	
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("User-Agent", "tenkai-app")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		// リポジトリが既に存在する
+		return nil
+	}
+
+	// リポジトリを作成
+	createData := map[string]interface{}{
+		"name":        ".tenkai-settings",
+		"description": "tenkai editor settings",
+		"private":     true,
+		"auto_init":   true,
+	}
+
+	createJSON, err := json.Marshal(createData)
+	if err != nil {
+		return err
+	}
+
+	createURL := "https://api.github.com/user/repos"
+	req, err = http.NewRequest("POST", createURL, strings.NewReader(string(createJSON)))
+	if err != nil {
+		return err
+	}
+	
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("User-Agent", "tenkai-app")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err = client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to create repository: %d, %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+// ヘルパー関数: ファイルのSHA取得
+func getFileSHA(accessToken, username, filename string) (string, error) {
+	fileURL := fmt.Sprintf("https://api.github.com/repos/%s/.tenkai-settings/contents/%s", username, filename)
+	req, err := http.NewRequest("GET", fileURL, nil)
+	if err != nil {
+		return "", err
+	}
+	
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("User-Agent", "tenkai-app")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("file not found")
+	}
+
+	var file GitHubFile
+	if err := json.NewDecoder(resp.Body).Decode(&file); err != nil {
+		return "", err
+	}
+
+	return file.SHA, nil
+}
+
