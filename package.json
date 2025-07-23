@@ -1,0 +1,19 @@
+{
+  "name": "tenkai_server",
+  "version": "0.1.0",
+  "description": "Git wrapper server for tenkai (Go version)",
+  "scripts": {
+    "start": "go run main.go",
+    "build": "go build -o tenkai_server",
+    "dev": "air"
+  },
+  "keywords": [
+    "git",
+    "wrapper",
+    "api",
+    "japanese",
+    "go"
+  ],
+  "author": "AoyamaRito",
+  "license": "MIT"
+}
