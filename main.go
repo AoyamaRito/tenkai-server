@@ -160,6 +160,12 @@ func main() {
 	})
 
 	// ルート定義
+	r.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, Response{
+			Success: true,
+			Message: "tenkai API server is running",
+		})
+	})
 	r.POST("/api/init", handleInit)
 	r.POST("/api/save", handleSave)
 	r.GET("/api/history", handleHistory)
@@ -168,7 +174,7 @@ func main() {
 	r.POST("/api/draft/switch", handleDraftSwitch)
 	r.GET("/api/status", handleStatus)
 	r.POST("/api/ai/analyze", handleAIAnalyze)
-	r.POST("/api/auth/github/callback", handleGitHubCallback)
+	r.GET("/api/auth/github/callback", handleGitHubCallback)
 	// GitHub設定管理API
 	r.GET("/api/settings", handleGetSettings)
 	r.POST("/api/settings", handleSaveSettings)
