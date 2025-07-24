@@ -765,7 +765,7 @@ func generateAICommitMessage(changes string) string {
 func handleGitHubCallback(c *gin.Context) {
 	// GETパラメータから取得
 	code := c.Query("code")
-	state := c.Query("state")
+	// state := c.Query("state") // 現在は使用していないがCSRF対策で将来使用予定
 	errorParam := c.Query("error")
 	
 	// フロントエンドURLを環境変数から取得
