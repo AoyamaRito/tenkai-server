@@ -124,6 +124,45 @@ type SettingsRequest struct {
 	Settings    TenkaiSettings `json:"settings,omitempty"`
 }
 
+// Gitラッパー用リクエスト構造体
+type SouanTeishutsuRequest struct {
+	AccessToken string `json:"access_token" binding:"required"`
+	Repository  string `json:"repository" binding:"required"`
+	Message     string `json:"message" binding:"required"`
+	Branch      string `json:"branch"`
+	Files       []struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+		Mode    string `json:"mode"` // "100644" for regular files
+	} `json:"files"`
+}
+
+type SouanRequest struct {
+	AccessToken string `json:"access_token" binding:"required"`
+	Repository  string `json:"repository" binding:"required"`
+	Name        string `json:"name" binding:"required"`
+	BaseBranch  string `json:"base_branch"` // デフォルト: main
+}
+
+type ShuseiIraiRequest struct {
+	AccessToken string `json:"access_token" binding:"required"`
+	Repository  string `json:"repository" binding:"required"`
+	Branch      string `json:"branch" binding:"required"`
+	Title       string `json:"title" binding:"required"`
+	Description string `json:"description"`
+	BaseBranch  string `json:"base_branch"` // デフォルト: main
+}
+
+type KouseiIraiRequest struct {
+	AccessToken string   `json:"access_token" binding:"required"`
+	Repository  string   `json:"repository" binding:"required"`
+	Branch      string   `json:"branch" binding:"required"`
+	Title       string   `json:"title" binding:"required"`
+	Description string   `json:"description"`
+	Reviewers   []string `json:"reviewers"` // GitHubユーザー名のリスト
+	BaseBranch  string   `json:"base_branch"` // デフォルト: main
+}
+
 func main() {
 	// 環境変数からGemini APIキーを取得して初期化
 	geminiAPIKey := os.Getenv("GEMINI_API_KEY")
@@ -179,6 +218,14 @@ func main() {
 	r.GET("/api/settings", handleGetSettings)
 	r.POST("/api/settings", handleSaveSettings)
 	r.GET("/api/repositories", handleGetRepositories)
+	// Gitラッパー API (日本語化対応)
+	r.POST("/api/git/souan-teishutsu", handleSouanTeishutsu)    // 草案提出（commit）
+	r.GET("/api/git/souan-list", handleSouanList)               // 草案一覧（branch list）
+	r.POST("/api/git/souan-create", handleSouanCreate)          // 草案作成（branch create）
+	r.POST("/api/git/souan-switch", handleSouanSwitch)          // 草案切替（branch switch）
+	r.POST("/api/git/shusei-irai", handleShuseiIrai)            // 修正依頼（push & PR）
+	r.POST("/api/git/kousei-irai", handleKouseiIrai)            // 校正依頼（push & PR with review）
+	r.GET("/api/git/repository-info", handleRepositoryInfo)      // リポジトリ情報取得
 
 	// サーバー起動
 	port := os.Getenv("PORT")
@@ -716,18 +763,25 @@ func generateAICommitMessage(changes string) string {
 
 // GitHub OAuth認証処理
 func handleGitHubCallback(c *gin.Context) {
-	// クエリパラメータから直接取得
+	// GETパラメータから取得
 	code := c.Query("code")
+	state := c.Query("state")
 	errorParam := c.Query("error")
+	
+	// フロントエンドURLを環境変数から取得
+	frontendURL := os.Getenv("FRONTEND_URL")
+	if frontendURL == "" {
+		frontendURL = "https://tenkai-production.up.railway.app"
+	}
 	
 	// エラーチェック
 	if errorParam != "" {
-		c.Redirect(http.StatusTemporaryRedirect, "https://tenkai-production.up.railway.app/auth?error="+errorParam)
+		c.Redirect(http.StatusTemporaryRedirect, fmt.Sprintf("%s/auth?error=%s", frontendURL, errorParam))
 		return
 	}
 	
 	if code == "" {
-		c.Redirect(http.StatusTemporaryRedirect, "https://tenkai-production.up.railway.app/auth?error=missing_code")
+		c.Redirect(http.StatusTemporaryRedirect, fmt.Sprintf("%s/auth?error=missing_code", frontendURL))
 		return
 	}
 
@@ -736,7 +790,10 @@ func handleGitHubCallback(c *gin.Context) {
 	clientSecret := os.Getenv("GITHUB_CLIENT_SECRET")
 	
 	if clientID == "" || clientSecret == "" {
-		c.Redirect(http.StatusTemporaryRedirect, "https://tenkai-production.up.railway.app/auth?error=oauth_config_missing")
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "OAuth設定が不足しています",
+		})
 		return
 	}
 
@@ -830,10 +887,10 @@ func handleGitHubCallback(c *gin.Context) {
 		return
 	}
 
-	// 認証成功後、ユーザー情報をクッキーまたはセッションに保存してフロントエンドにリダイレクト
-	// 簡易実装：URLパラメータでトークンを渡す（本番環境では安全な方法を使用）
-	redirectURL := fmt.Sprintf("https://tenkai-production.up.railway.app/app?token=%s&user=%s", 
-		accessToken, 
+	// 認証成功後、フロントエンドにリダイレクト（一時的な実装）
+	redirectURL := fmt.Sprintf("%s/app?auth_success=true&token=%s&user=%s", 
+		frontendURL,
+		url.QueryEscape(accessToken), 
 		url.QueryEscape(user.Login))
 	
 	c.Redirect(http.StatusTemporaryRedirect, redirectURL)
@@ -1235,5 +1292,523 @@ func getFileSHA(accessToken, username, filename string) (string, error) {
 	}
 
 	return file.SHA, nil
+}
+
+// 草案提出（コミット）
+func handleSouanTeishutsu(c *gin.Context) {
+	var req SouanTeishutsuRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, Response{
+			Success: false,
+			Message: "リクエストが不正です",
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	// ブランチの設定（デフォルト: main）
+	branch := req.Branch
+	if branch == "" {
+		branch = "main"
+	}
+
+	// 各ファイルをコミット
+	for _, file := range req.Files {
+		// ファイルの内容をBase64エンコード
+		contentEncoded := base64.StdEncoding.EncodeToString([]byte(file.Content))
+		
+		// 既存ファイルのSHAを取得
+		existingSHA := ""
+		fileURL := fmt.Sprintf("https://api.github.com/repos/%s/contents/%s", req.Repository, file.Path)
+		getReq, _ := http.NewRequest("GET", fileURL+"?ref="+branch, nil)
+		getReq.Header.Set("Authorization", "Bearer "+req.AccessToken)
+		getReq.Header.Set("User-Agent", "tenkai-app")
+		
+		client := &http.Client{}
+		getResp, err := client.Do(getReq)
+		if err == nil && getResp.StatusCode == http.StatusOK {
+			defer getResp.Body.Close()
+			var existingFile GitHubFile
+			if json.NewDecoder(getResp.Body).Decode(&existingFile) == nil {
+				existingSHA = existingFile.SHA
+			}
+		}
+		
+		// ファイルを更新/作成
+		updateData := map[string]interface{}{
+			"message": req.Message,
+			"content": contentEncoded,
+			"branch":  branch,
+		}
+		
+		if existingSHA != "" {
+			updateData["sha"] = existingSHA
+		}
+		
+		updateJSON, _ := json.Marshal(updateData)
+		
+		putReq, _ := http.NewRequest("PUT", fileURL, strings.NewReader(string(updateJSON)))
+		putReq.Header.Set("Authorization", "Bearer "+req.AccessToken)
+		putReq.Header.Set("User-Agent", "tenkai-app")
+		putReq.Header.Set("Content-Type", "application/json")
+		
+		putResp, err := client.Do(putReq)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, Response{
+				Success: false,
+				Message: "ファイルのコミットに失敗しました",
+				Error:   err.Error(),
+			})
+			return
+		}
+		defer putResp.Body.Close()
+		
+		if putResp.StatusCode != http.StatusOK && putResp.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(putResp.Body)
+			c.JSON(http.StatusInternalServerError, Response{
+				Success: false,
+				Message: "ファイルのコミットに失敗しました",
+				Error:   string(body),
+			})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, Response{
+		Success: true,
+		Message: "草案を提出しました",
+		Data: map[string]interface{}{
+			"repository": req.Repository,
+			"branch":     branch,
+			"message":    req.Message,
+		},
+	})
+}
+
+// 草案一覧取得
+func handleSouanList(c *gin.Context) {
+	accessToken := c.GetHeader("Authorization")
+	repository := c.Query("repository")
+	
+	if accessToken == "" || repository == "" {
+		c.JSON(http.StatusBadRequest, Response{
+			Success: false,
+			Message: "認証トークンとリポジトリ名が必要です",
+		})
+		return
+	}
+	
+	// "Bearer " プレフィックスを削除
+	if strings.HasPrefix(accessToken, "Bearer ") {
+		accessToken = strings.TrimPrefix(accessToken, "Bearer ")
+	}
+
+	// ブランチ一覧を取得
+	branchesURL := fmt.Sprintf("https://api.github.com/repos/%s/branches", repository)
+	req, _ := http.NewRequest("GET", branchesURL, nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("User-Agent", "tenkai-app")
+	
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "草案一覧の取得に失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "草案一覧の取得に失敗しました",
+			Error:   fmt.Sprintf("GitHub API error: %d", resp.StatusCode),
+		})
+		return
+	}
+	
+	var branches []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&branches); err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "レスポンスのパースに失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+	
+	// 日本語化した草案情報を作成
+	souanList := make([]map[string]interface{}, len(branches))
+	for i, branch := range branches {
+		souanList[i] = map[string]interface{}{
+			"name":      branch["name"],
+			"protected": branch["protected"],
+			"commit":    branch["commit"],
+		}
+	}
+	
+	c.JSON(http.StatusOK, Response{
+		Success: true,
+		Data:    souanList,
+	})
+}
+
+// 草案作成
+func handleSouanCreate(c *gin.Context) {
+	var req SouanRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, Response{
+			Success: false,
+			Message: "リクエストが不正です",
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	// ベースブランチの設定（デフォルト: main）
+	baseBranch := req.BaseBranch
+	if baseBranch == "" {
+		baseBranch = "main"
+	}
+
+	// ベースブランチの最新コミットを取得
+	baseRefURL := fmt.Sprintf("https://api.github.com/repos/%s/git/refs/heads/%s", req.Repository, baseBranch)
+	getReq, _ := http.NewRequest("GET", baseRefURL, nil)
+	getReq.Header.Set("Authorization", "Bearer "+req.AccessToken)
+	getReq.Header.Set("User-Agent", "tenkai-app")
+	
+	client := &http.Client{}
+	getResp, err := client.Do(getReq)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "ベースブランチの取得に失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+	defer getResp.Body.Close()
+	
+	var baseRef map[string]interface{}
+	if err := json.NewDecoder(getResp.Body).Decode(&baseRef); err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "ベースブランチ情報のパースに失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+	
+	// 新しいブランチの参照を作成
+	createRefURL := fmt.Sprintf("https://api.github.com/repos/%s/git/refs", req.Repository)
+	createData := map[string]interface{}{
+		"ref": fmt.Sprintf("refs/heads/%s", req.Name),
+		"sha": baseRef["object"].(map[string]interface{})["sha"],
+	}
+	
+	createJSON, _ := json.Marshal(createData)
+	
+	postReq, _ := http.NewRequest("POST", createRefURL, strings.NewReader(string(createJSON)))
+	postReq.Header.Set("Authorization", "Bearer "+req.AccessToken)
+	postReq.Header.Set("User-Agent", "tenkai-app")
+	postReq.Header.Set("Content-Type", "application/json")
+	
+	postResp, err := client.Do(postReq)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "草案の作成に失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+	defer postResp.Body.Close()
+	
+	if postResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(postResp.Body)
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "草案の作成に失敗しました",
+			Error:   string(body),
+		})
+		return
+	}
+	
+	c.JSON(http.StatusOK, Response{
+		Success: true,
+		Message: fmt.Sprintf("草案「%s」を作成しました", req.Name),
+		Data: map[string]interface{}{
+			"repository": req.Repository,
+			"name":       req.Name,
+			"baseBranch": baseBranch,
+		},
+	})
+}
+
+// 草案切替
+func handleSouanSwitch(c *gin.Context) {
+	// このAPIはクライアント側で現在の作業ブランチを管理するため、
+	// サーバー側では特に処理は不要
+	var req SouanRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, Response{
+			Success: false,
+			Message: "リクエストが不正です",
+			Error:   err.Error(),
+		})
+		return
+	}
+	
+	c.JSON(http.StatusOK, Response{
+		Success: true,
+		Message: fmt.Sprintf("草案「%s」に切り替えました", req.Name),
+		Data: map[string]interface{}{
+			"repository": req.Repository,
+			"name":       req.Name,
+		},
+	})
+}
+
+// 修正依頼（プルリクエスト作成）
+func handleShuseiIrai(c *gin.Context) {
+	var req ShuseiIraiRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, Response{
+			Success: false,
+			Message: "リクエストが不正です",
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	// ベースブランチの設定（デフォルト: main）
+	baseBranch := req.BaseBranch
+	if baseBranch == "" {
+		baseBranch = "main"
+	}
+
+	// プルリクエストを作成
+	prURL := fmt.Sprintf("https://api.github.com/repos/%s/pulls", req.Repository)
+	prData := map[string]interface{}{
+		"title": req.Title,
+		"body":  req.Description,
+		"head":  req.Branch,
+		"base":  baseBranch,
+	}
+	
+	prJSON, _ := json.Marshal(prData)
+	
+	prReq, _ := http.NewRequest("POST", prURL, strings.NewReader(string(prJSON)))
+	prReq.Header.Set("Authorization", "Bearer "+req.AccessToken)
+	prReq.Header.Set("User-Agent", "tenkai-app")
+	prReq.Header.Set("Content-Type", "application/json")
+	
+	client := &http.Client{}
+	prResp, err := client.Do(prReq)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "修正依頼の作成に失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+	defer prResp.Body.Close()
+	
+	if prResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(prResp.Body)
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "修正依頼の作成に失敗しました",
+			Error:   string(body),
+		})
+		return
+	}
+	
+	var prResult map[string]interface{}
+	if err := json.NewDecoder(prResp.Body).Decode(&prResult); err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "レスポンスのパースに失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+	
+	c.JSON(http.StatusOK, Response{
+		Success: true,
+		Message: "修正依頼を作成しました",
+		Data: map[string]interface{}{
+			"repository": req.Repository,
+			"pullRequestNumber": prResult["number"],
+			"pullRequestURL": prResult["html_url"],
+		},
+	})
+}
+
+// 校正依頼（レビュワー付きプルリクエスト作成）
+func handleKouseiIrai(c *gin.Context) {
+	var req KouseiIraiRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, Response{
+			Success: false,
+			Message: "リクエストが不正です",
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	// ベースブランチの設定（デフォルト: main）
+	baseBranch := req.BaseBranch
+	if baseBranch == "" {
+		baseBranch = "main"
+	}
+
+	// プルリクエストを作成
+	prURL := fmt.Sprintf("https://api.github.com/repos/%s/pulls", req.Repository)
+	prData := map[string]interface{}{
+		"title": req.Title,
+		"body":  req.Description + "\n\n📝 校正をお願いします",
+		"head":  req.Branch,
+		"base":  baseBranch,
+	}
+	
+	prJSON, _ := json.Marshal(prData)
+	
+	prReq, _ := http.NewRequest("POST", prURL, strings.NewReader(string(prJSON)))
+	prReq.Header.Set("Authorization", "Bearer "+req.AccessToken)
+	prReq.Header.Set("User-Agent", "tenkai-app")
+	prReq.Header.Set("Content-Type", "application/json")
+	
+	client := &http.Client{}
+	prResp, err := client.Do(prReq)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "校正依頼の作成に失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+	defer prResp.Body.Close()
+	
+	if prResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(prResp.Body)
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "校正依頼の作成に失敗しました",
+			Error:   string(body),
+		})
+		return
+	}
+	
+	var prResult map[string]interface{}
+	if err := json.NewDecoder(prResp.Body).Decode(&prResult); err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "レスポンスのパースに失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+	
+	// レビュワーを追加
+	if len(req.Reviewers) > 0 {
+		reviewURL := fmt.Sprintf("https://api.github.com/repos/%s/pulls/%v/requested_reviewers", 
+			req.Repository, prResult["number"])
+		reviewData := map[string]interface{}{
+			"reviewers": req.Reviewers,
+		}
+		
+		reviewJSON, _ := json.Marshal(reviewData)
+		
+		reviewReq, _ := http.NewRequest("POST", reviewURL, strings.NewReader(string(reviewJSON)))
+		reviewReq.Header.Set("Authorization", "Bearer "+req.AccessToken)
+		reviewReq.Header.Set("User-Agent", "tenkai-app")
+		reviewReq.Header.Set("Content-Type", "application/json")
+		
+		reviewResp, err := client.Do(reviewReq)
+		if err != nil {
+			// レビュワー追加に失敗してもPRは作成されているので、警告のみ
+			log.Printf("レビュワーの追加に失敗: %v", err)
+		} else {
+			reviewResp.Body.Close()
+		}
+	}
+	
+	c.JSON(http.StatusOK, Response{
+		Success: true,
+		Message: "校正依頼を作成しました",
+		Data: map[string]interface{}{
+			"repository": req.Repository,
+			"pullRequestNumber": prResult["number"],
+			"pullRequestURL": prResult["html_url"],
+			"reviewers": req.Reviewers,
+		},
+	})
+}
+
+// リポジトリ情報取得
+func handleRepositoryInfo(c *gin.Context) {
+	accessToken := c.GetHeader("Authorization")
+	repository := c.Query("repository")
+	
+	if accessToken == "" || repository == "" {
+		c.JSON(http.StatusBadRequest, Response{
+			Success: false,
+			Message: "認証トークンとリポジトリ名が必要です",
+		})
+		return
+	}
+	
+	// "Bearer " プレフィックスを削除
+	if strings.HasPrefix(accessToken, "Bearer ") {
+		accessToken = strings.TrimPrefix(accessToken, "Bearer ")
+	}
+
+	// リポジトリ情報を取得
+	repoURL := fmt.Sprintf("https://api.github.com/repos/%s", repository)
+	req, _ := http.NewRequest("GET", repoURL, nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("User-Agent", "tenkai-app")
+	
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "リポジトリ情報の取得に失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "リポジトリ情報の取得に失敗しました",
+			Error:   fmt.Sprintf("GitHub API error: %d", resp.StatusCode),
+		})
+		return
+	}
+	
+	var repoInfo map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&repoInfo); err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Success: false,
+			Message: "レスポンスのパースに失敗しました",
+			Error:   err.Error(),
+		})
+		return
+	}
+	
+	c.JSON(http.StatusOK, Response{
+		Success: true,
+		Data:    repoInfo,
+	})
 }
 
