@@ -809,7 +809,6 @@ func handleGitHubCallback(c *gin.Context) {
 	userReq.Header.Set("Authorization", "Bearer "+accessToken)
 	userReq.Header.Set("User-Agent", "tenkai-app")
 
-	client := &http.Client{}
 	userResp, err := client.Do(userReq)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, Response{
